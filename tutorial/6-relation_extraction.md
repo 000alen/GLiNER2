@@ -49,21 +49,24 @@ results = extractor.extract(text, schema)
 
 ### Understanding the Output Format
 
-Relations are returned as tuples `(source, target)` grouped under the `relation_extraction` key:
+Relations are returned as tuples `(source, target)` grouped under the `relation_extraction` key. **All requested relation types are included in the output, even if no relations are found** (they appear as empty lists `[]`):
 
 ```python
 text = "Alice manages the Engineering team. Bob reports to Alice."
 results = extractor.extract_relations(
     text,
-    ["manages", "reports_to"]
+    ["manages", "reports_to", "founded"]  # Note: "founded" not found in text
 )
 # Output: {
 #     'relation_extraction': {
 #         'manages': [('Alice', 'Engineering team')],
-#         'reports_to': [('Bob', 'Alice')]
+#         'reports_to': [('Bob', 'Alice')],
+#         'founded': []  # Empty list - relation type requested but not found
 #     }
 # }
 ```
+
+This ensures consistent output structure - all requested relation types will always be present in the results, making it easier to process the output programmatically.
 
 ## Multiple Relation Types
 
@@ -210,21 +213,31 @@ results = extractor.batch_extract_relations(
 #     {
 #         'relation_extraction': {
 #             'works_for': [('John', 'Microsoft')],
-#             'lives_in': [('John', 'Seattle')]
+#             'lives_in': [('John', 'Seattle')],
+#             'founded': [],      # Not found in first text
+#             'reports_to': []   # Not found in first text
 #         }
 #     },
 #     {
 #         'relation_extraction': {
-#             'founded': [('Sarah', 'TechStartup')]
+#             'works_for': [],    # Not found in second text
+#             'founded': [('Sarah', 'TechStartup')],
+#             'reports_to': [],   # Not found in second text
+#             'lives_in': []      # Not found in second text
 #         }
 #     },
 #     {
 #         'relation_extraction': {
-#             'reports_to': [('Bob', 'Alice')]
+#             'works_for': [('Alice', 'Google')],
+#             'reports_to': [('Bob', 'Alice')],
+#             'founded': [],      # Not found in third text
+#             'lives_in': []      # Not found in third text
 #         }
 #     }
 # ]
 ```
+
+**Note**: All requested relation types appear in each result, even if empty. This ensures consistent structure across all batch results, making it easier to process programmatically.
 
 ## Combining with Other Tasks
 
@@ -462,6 +475,31 @@ results = extractor.batch_extract_relations(
 text = "John works for Apple. Mary works for Google. Bob works for Microsoft."
 results = extractor.extract_relations(text, ["works_for"])
 # Returns all three work relationships
+```
+
+### 7. Handle Empty Relations
+
+All requested relation types are always included in the output, even if empty:
+
+```python
+results = extractor.extract_relations(
+    "John works for Microsoft.",
+    ["works_for", "founded", "acquired"]
+)
+# Output: {
+#     'relation_extraction': {
+#         'works_for': [('John', 'Microsoft')],
+#         'founded': [],      # Empty - not found in text
+#         'acquired': []      # Empty - not found in text
+#     }
+# }
+
+# This makes it easy to check for relations programmatically:
+for rel_type, rels in results['relation_extraction'].items():
+    if rels:  # Non-empty
+        print(f"Found {len(rels)} {rel_type} relations")
+    else:  # Empty
+        print(f"No {rel_type} relations found")
 ```
 
 ### 7. Validate Relation Direction

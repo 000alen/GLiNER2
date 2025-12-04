@@ -1020,7 +1020,19 @@ class GLiNER2(Extractor):
 
                 # Format if requested
                 if format_results:
-                    results = self.format_results(raw_results, include_confidence)
+                    # Get all requested relation types from schema
+                    requested_relations = metadata.get("relation_order", [])
+                    # Also check schema dict for relations if not in metadata
+                    if not requested_relations and "relations" in record["schema"]:
+                        requested_relations = [
+                            list(rel.keys())[0] 
+                            for rel in record["schema"]["relations"]
+                        ]
+                    results = self.format_results(
+                        raw_results, 
+                        include_confidence,
+                        requested_relations=requested_relations if requested_relations else None
+                    )
                 else:
                     results = raw_results
 
@@ -1441,21 +1453,32 @@ class GLiNER2(Extractor):
         count, span_scores = self._predict_spans(embeddings, field_names, span_info)
 
         if count <= 0:
-            results[schema_name] = [] if schema_name == "entities" else {}
+            # For entities, return empty list
+            if schema_name == "entities":
+                results[schema_name] = []
+            elif outputs["task_types"][schema_idx] == "relations":
+                # For relations, add empty list so format_results knows this relation type was requested
+                results[schema_name] = []
+            else:
+                # For structures, return empty dict
+                results[schema_name] = {}
             return
 
         # Extract based on schema type
         if schema_name == "entities":
-            results[schema_name] = self._extract_entity_results(
+            extracted_results = self._extract_entity_results(
                 field_names, span_scores, record, outputs,
                 default_threshold, entity_metadata, entity_order
             )
+            results[schema_name] = extracted_results
         elif outputs["task_types"][schema_idx] == "relations":
             # Relations are extracted differently - they have head and tail fields
-            results[schema_name] = self._extract_relation_results(
+            extracted_results = self._extract_relation_results(
                 schema_name, field_names, span_scores, count, record, outputs,
                 default_threshold, relation_metadata, field_orders
             )
+            # Always add to results (empty list if no relations found)
+            results[schema_name] = extracted_results if extracted_results else []
         else:
             results[schema_name] = self._extract_structure_results(
                 schema_name, field_names, span_scores, count, record, outputs,
@@ -1837,7 +1860,12 @@ class GLiNER2(Extractor):
         # Return only the text, maintaining confidence order
         return [text for text, _, _, _ in selected]
 
-    def format_results(self, results: Dict[str, Any], include_confidence: bool = False) -> Dict[str, Any]:
+    def format_results(
+        self, 
+        results: Dict[str, Any], 
+        include_confidence: bool = False,
+        requested_relations: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
         """
         Format raw extraction results into clean, user-friendly output.
 
@@ -1855,6 +1883,9 @@ class GLiNER2(Extractor):
         include_confidence : bool, default=False
             If True, includes confidence scores in the output.
             If False, returns only the extracted values.
+        requested_relations : List[str], optional
+            List of all relation types that were requested in the schema.
+            If provided, ensures all requested relations appear in output, even if empty.
 
         Returns
         -------
@@ -1863,15 +1894,30 @@ class GLiNER2(Extractor):
         """
         formatted = {}
         relations = {}
+        found_relation_keys = set()
 
         for key, value in results.items():
-            if isinstance(value, list) and len(value) > 0:
-                # Check if this is a relation result (list of tuples)
-                if isinstance(value[0], tuple) and len(value[0]) == 2:
-                    # This is a relation result - collect under relations
+            if isinstance(value, list):
+                # Check if this is a relation result (list of tuples or empty list from relations)
+                if len(value) > 0 and isinstance(value[0], tuple) and len(value[0]) == 2:
+                    # This is a relation result with tuples - collect under relations
                     relations[key] = value
+                    found_relation_keys.add(key)
+                elif len(value) == 0 and key not in formatted:
+                    # Empty list - could be empty relation or empty entity list
+                    # Check if it's a relation by checking requested_relations
+                    if requested_relations and key in requested_relations:
+                        # This is an empty relation
+                        relations[key] = []
+                        found_relation_keys.add(key)
+                    elif key == "entities":
+                        # Empty entity list
+                        formatted[key] = {}
+                    else:
+                        # Other empty lists
+                        formatted[key] = value
                 # Handle entity results (list of dicts)
-                elif isinstance(value[0], dict):
+                elif len(value) > 0 and isinstance(value[0], dict):
                     if key == "entities":
                         # Format entities specially
                         formatted[key] = self._format_entities(value[0], include_confidence)
@@ -1904,9 +1950,22 @@ class GLiNER2(Extractor):
                 # Direct value
                 formatted[key] = value
 
-        # Add all relations under 'relation_extraction' key if any were found
-        if relations:
-            formatted["relation_extraction"] = relations
+        # Build relation_extraction dictionary
+        relation_extraction = {}
+        
+        # Add found relations (both non-empty and empty)
+        for rel_type, rel_values in relations.items():
+            relation_extraction[rel_type] = rel_values
+        
+        # Add empty lists for requested relations that weren't found in results
+        if requested_relations:
+            for rel_type in requested_relations:
+                if rel_type not in relation_extraction:
+                    relation_extraction[rel_type] = []
+        
+        # Add relation_extraction if we have any relations (found, empty, or requested)
+        if relation_extraction:
+            formatted["relation_extraction"] = relation_extraction
 
         return formatted
 
