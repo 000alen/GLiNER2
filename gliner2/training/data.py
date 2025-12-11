@@ -157,7 +157,6 @@ class DataLoader_Factory:
         shuffle: bool = True,
         seed: int = 42,
         validate: bool = False,
-        strict_validation: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Load data from any supported format.
@@ -173,9 +172,9 @@ class DataLoader_Factory:
         seed : int, default=42
             Random seed for shuffling.
         validate : bool, default=False
-            Whether to validate the data.
-        strict_validation : bool, default=False
-            If True, checks that entity spans exist in text.
+            Whether to validate the data. Validation is always strict:
+            checks that entity spans, relation values, and structure
+            field values exist in the text.
             
         Returns
         -------
@@ -202,7 +201,29 @@ class DataLoader_Factory:
         
         # Validate if requested
         if validate and records:
-            DataLoader_Factory._validate_records(records, strict_validation)
+            valid_indices, invalid_info = DataLoader_Factory._validate_records(records)
+            
+            if invalid_info:
+                total_records = len(records)
+                num_invalid = len(invalid_info)
+                num_valid = len(valid_indices)
+                
+                print(f"\nValidation: Found {num_invalid} invalid record(s) out of {total_records} total")
+                print("Removed invalid records:")
+                
+                # Print first 5 invalid records
+                for idx, (record_idx, record, errors) in enumerate(invalid_info[:5]):
+                    # Print first error for this record
+                    error_msg = errors[0] if errors else "Unknown error"
+                    print(f"  Record {record_idx}: {error_msg}")
+                
+                if num_invalid > 5:
+                    print(f"  ... and {num_invalid - 5} more invalid record(s)")
+                
+                print(f"Kept {num_valid} valid record(s)\n")
+                
+                # Filter records to keep only valid ones
+                records = [records[i] for i in valid_indices]
         
         # Shuffle
         if shuffle and records:
@@ -289,25 +310,38 @@ class DataLoader_Factory:
             )
     
     @staticmethod
-    def _validate_records(records: List[Dict], strict: bool):
-        """Validate all records."""
-        errors = []
+    def _validate_records(records: List[Dict]) -> Tuple[List[int], List[Tuple[int, Dict, List[str]]]]:
+        """
+        Validate all records and return validation results.
+        
+        Validation is always strict: checks that entity spans, relation values,
+        and structure field values exist in the text.
+        
+        Returns
+        -------
+        Tuple[List[int], List[Tuple[int, Dict, List[str]]]]
+            - First element: List of valid record indices
+            - Second element: List of (index, record, error_messages) for invalid records
+        """
+        valid_indices = []
+        invalid_info = []
+        
         for i, record in enumerate(records):
+            errors = []
             try:
                 example = InputExample.from_dict(record)
-                record_errors = example.validate(strict=strict)
-                for err in record_errors:
-                    errors.append(f"Record {i}: {err}")
+                record_errors = example.validate()
+                if record_errors:
+                    errors.extend(record_errors)
             except Exception as e:
-                errors.append(f"Record {i}: Failed to parse - {e}")
-        
-        if errors:
-            error_msg = f"Data validation failed with {len(errors)} errors"
-            if len(errors) <= 10:
-                error_msg += ":\n  - " + "\n  - ".join(errors)
+                errors.append(f"Failed to parse - {e}")
+            
+            if errors:
+                invalid_info.append((i, record, errors))
             else:
-                error_msg += f":\n  - " + "\n  - ".join(errors[:10]) + f"\n  ... and {len(errors)-10} more"
-            raise ValidationError(error_msg, errors)
+                valid_indices.append(i)
+        
+        return valid_indices, invalid_info
 
 
 # Type alias for flexible data input
@@ -453,7 +487,20 @@ class Structure:
         self._fields = fields
         self.descriptions = _descriptions
 
-    def validate(self, text: str = None) -> List[str]:
+    def validate(self, text: str) -> List[str]:
+        """
+        Validate this structure.
+        
+        Parameters
+        ----------
+        text : str
+            The text to validate against. Field values must exist in this text.
+        
+        Returns
+        -------
+        List[str]
+            List of validation errors.
+        """
         errors = []
         if not self.struct_name:
             errors.append("Structure name cannot be empty")
@@ -464,10 +511,10 @@ class Structure:
                 errors.extend(value.validate(f"{self.struct_name}.{field_name}"))
             elif isinstance(value, list):
                 for i, v in enumerate(value):
-                    if text and v and v.lower() not in text.lower():
+                    if v and v.lower() not in text.lower():
                         errors.append(f"List value '{v}' at index {i} in '{self.struct_name}.{field_name}' not found in text")
             elif isinstance(value, str):
-                if text and value and value.lower() not in text.lower():
+                if value and value.lower() not in text.lower():
                     errors.append(f"Value '{value}' for '{self.struct_name}.{field_name}' not found in text")
         return errors
 
@@ -522,14 +569,27 @@ class Relation:
             if tail is not None:
                 self._fields["tail"] = tail
 
-    def validate(self, text: str = None) -> List[str]:
+    def validate(self, text: str) -> List[str]:
+        """
+        Validate this relation.
+        
+        Parameters
+        ----------
+        text : str
+            The text to validate against. Field values must exist in this text.
+        
+        Returns
+        -------
+        List[str]
+            List of validation errors.
+        """
         errors = []
         if not self.name:
             errors.append("Relation name cannot be empty")
         if not self._fields:
             errors.append(f"Relation '{self.name}' has no fields")
         for field_name, value in self._fields.items():
-            if isinstance(value, str) and text and value:
+            if isinstance(value, str) and value:
                 if value.lower() not in text.lower():
                     errors.append(f"Relation value '{value}' for '{self.name}.{field_name}' not found in text")
         return errors
@@ -585,8 +645,18 @@ class InputExample:
         if self.relations is None:
             self.relations = []
 
-    def validate(self, strict: bool = True) -> List[str]:
-        """Validate this example."""
+    def validate(self) -> List[str]:
+        """
+        Validate this example.
+        
+        Validation is always strict: checks that entity mentions, relation values,
+        and structure field values exist in the text (case-insensitive).
+        
+        Returns
+        -------
+        List[str]
+            List of validation errors. Empty list means valid.
+        """
         errors = []
         if not self.text or not self.text.strip():
             errors.append("Text cannot be empty")
@@ -597,7 +667,7 @@ class InputExample:
                 if not entity_type:
                     errors.append("Entity type cannot be empty")
                 for mention in mentions:
-                    if strict and mention and mention.lower() not in self.text.lower():
+                    if mention and mention.lower() not in self.text.lower():
                         errors.append(f"Entity '{mention}' (type: {entity_type}) not found in text")
 
         if self.entity_descriptions and self.entities:
@@ -609,11 +679,11 @@ class InputExample:
             errors.extend(cls.validate())
 
         for struct in self.structures:
-            errors.extend(struct.validate(self.text if strict else None))
+            errors.extend(struct.validate(self.text))
 
         relation_fields = {}
         for rel in self.relations:
-            errors.extend(rel.validate(self.text if strict else None))
+            errors.extend(rel.validate(self.text))
             field_names = tuple(sorted(rel.get_field_names()))
             if rel.name in relation_fields:
                 if relation_fields[rel.name] != field_names:
@@ -627,8 +697,9 @@ class InputExample:
 
         return errors
 
-    def is_valid(self, strict: bool = True) -> bool:
-        return len(self.validate(strict)) == 0
+    def is_valid(self) -> bool:
+        """Check if this example is valid."""
+        return len(self.validate()) == 0
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to GLiNER2 training format."""
@@ -756,14 +827,30 @@ class TrainingDataset:
         self.examples.extend(examples)
         return self
 
-    def validate(self, strict: bool = True, raise_on_error: bool = True) -> Dict[str, Any]:
-        """Validate all examples in the dataset."""
+    def validate(self, raise_on_error: bool = True) -> Dict[str, Any]:
+        """
+        Validate all examples in the dataset.
+        
+        Validation is always strict: checks that entity mentions, relation values,
+        and structure field values exist in the text (case-insensitive).
+        
+        Parameters
+        ----------
+        raise_on_error : bool, default=True
+            If True, raises ValidationError when invalid examples are found.
+            If False, returns validation report without raising.
+        
+        Returns
+        -------
+        Dict[str, Any]
+            Validation report with counts and error details.
+        """
         all_errors = []
         valid_count = 0
         invalid_indices = []
 
         for i, example in enumerate(self.examples):
-            errors = example.validate(strict)
+            errors = example.validate()
             if errors:
                 invalid_indices.append(i)
                 for error in errors:

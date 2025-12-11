@@ -295,7 +295,6 @@ class ExtractorDataset(Dataset):
             shuffle: bool = True,
             seed: int = 42,
             validate: bool = False,
-            strict_validation: bool = False,
     ):
         """
         Initialize dataset from various input formats.
@@ -311,9 +310,9 @@ class ExtractorDataset(Dataset):
         seed : int, default=42
             Random seed for shuffling.
         validate : bool, default=False
-            Whether to validate the data.
-        strict_validation : bool, default=False
-            If True, checks that entity spans exist in text.
+            Whether to validate the data. Validation is always strict:
+            checks that entity spans, relation values, and structure
+            field values exist in the text.
         """
         self.data = DataLoader_Factory.load(
             data=data,
@@ -321,7 +320,6 @@ class ExtractorDataset(Dataset):
             shuffle=shuffle,
             seed=seed,
             validate=validate,
-            strict_validation=strict_validation,
         )
 
     def __len__(self) -> int:
