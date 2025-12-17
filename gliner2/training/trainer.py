@@ -1022,9 +1022,11 @@ class GLiNER2Trainer:
                         self._log_metrics(metrics, prefix="train")
                         tr_loss = 0.0
 
-                    if self.config.eval_strategy == "steps" and self.global_step % self.config.eval_steps == 0 and eval_dataset:
-                        self._evaluate(eval_dataset)
-                        self.model.train()
+                    if self.config.eval_strategy == "steps" and self.global_step % self.config.eval_steps == 0:
+                        if eval_dataset:
+                            self._evaluate(eval_dataset)
+                            self.model.train()
+                            self.processor.change_mode(is_training=True)
                         self._save_checkpoint(f"checkpoint-{self.global_step}")
 
                     self.progress_bar.update(1)
@@ -1042,13 +1044,15 @@ class GLiNER2Trainer:
             avg_epoch_loss = self._safe_divide(epoch_loss, epoch_steps, default=0.0)
             logger.info(f"Epoch {epoch + 1}/{num_epochs} - Loss: {avg_epoch_loss:.4f}")
 
-            if self.config.eval_strategy == "epoch" and eval_dataset:
-                eval_metrics = self._evaluate(eval_dataset)
-                self.model.train()
+            if self.config.eval_strategy == "epoch":
+                if eval_dataset:
+                    eval_metrics = self._evaluate(eval_dataset)
+                    self.model.train()
+                    self.processor.change_mode(is_training=True)
+                    if self.config.early_stopping and self._check_early_stopping(eval_metrics):
+                        logger.info(f"Early stopping triggered at epoch {epoch + 1}")
+                        break
                 self._save_checkpoint(f"checkpoint-epoch-{epoch + 1}")
-                if self.config.early_stopping and self._check_early_stopping(eval_metrics):
-                    logger.info(f"Early stopping triggered at epoch {epoch + 1}")
-                    break
 
             if self.global_step >= max_steps:
                 break
@@ -1058,7 +1062,7 @@ class GLiNER2Trainer:
 
         if self.is_main_process:
             self._save_checkpoint("final")
-            if self.wandb_run:
+            if self.config.report_to_wandb:
                 import wandb
                 wandb.summary["best_metric"] = self.best_metric
                 wandb.summary["total_steps"] = self.global_step
@@ -1196,14 +1200,14 @@ class GLiNER2Trainer:
             if postfix:
                 self.progress_bar.set_postfix(postfix)
 
-        # W&B logging (HuggingFace style)
-        if self.wandb_run:
+        # W&B logging
+        if self.config.report_to_wandb and self.is_main_process:
             try:
                 import wandb
                 # Filter out NaN and Inf values for wandb
                 wandb_metrics = {
-                    f"{prefix}_{k}": v 
-                    for k, v in metrics.items() 
+                    k: v
+                    for k, v in metrics.items()
                     if isinstance(v, (int, float)) and not (math.isnan(v) or math.isinf(v))
                 }
                 if wandb_metrics:
@@ -1274,7 +1278,7 @@ class GLiNER2Trainer:
         )
 
         # Save model artifacts to W&B for best and final checkpoints
-        if self.wandb_run and name in ["best", "final"]:
+        if self.config.report_to_wandb and name in ["best", "final"]:
             try:
                 import wandb
                 artifact = wandb.Artifact(
@@ -1289,7 +1293,7 @@ class GLiNER2Trainer:
                     }
                 )
                 artifact.add_dir(str(checkpoint_dir))
-                self.wandb_run.log_artifact(artifact)
+                wandb.log_artifact(artifact)
             except Exception as e:
                 logger.warning(f"W&B artifact upload failed: {e}")
 

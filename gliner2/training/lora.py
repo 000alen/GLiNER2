@@ -193,11 +193,14 @@ class LoRALayer(nn.Module):
         for param in self.base_layer.parameters():
             param.requires_grad = False
         
+        # Get device from base layer to ensure LoRA parameters are on same device
+        device = next(base_layer.parameters()).device
+        
         # LoRA low-rank matrices
         # A: (r, in_features) - initialized with small random values
         # B: (out_features, r) - initialized to zero (no change at start)
-        self.lora_A = nn.Parameter(torch.zeros(r, in_features))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, r))
+        self.lora_A = nn.Parameter(torch.zeros(r, in_features, device=device))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, r, device=device))
         
         # Initialize A with Kaiming uniform (same as nn.Linear default)
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
@@ -727,8 +730,10 @@ def load_lora_adapter(
             lora_b_key = f"{name}.lora_B"
             
             if lora_a_key in lora_state and lora_b_key in lora_state:
-                module.lora_A.data = lora_state[lora_a_key]
-                module.lora_B.data = lora_state[lora_b_key]
+                # Move loaded tensors to the same device as the module
+                device = next(module.parameters()).device
+                module.lora_A.data = lora_state[lora_a_key].to(device)
+                module.lora_B.data = lora_state[lora_b_key].to(device)
                 logger.debug(f"Loaded weights for {name}")
             else:
                 logger.warning(f"No saved weights found for {name}")
