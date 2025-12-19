@@ -369,20 +369,26 @@ class GLiNER2(Extractor):
         for schema in schema_list:
             if hasattr(schema, 'build'):
                 schema_dict = schema.build()
+                # Extract classification task names
+                classification_tasks = [c["task"] for c in schema_dict.get("classifications", [])]
                 metadata = {
                     "field_metadata": schema._field_metadata,
                     "entity_metadata": schema._entity_metadata,
                     "relation_metadata": getattr(schema, '_relation_metadata', {}),
                     "field_orders": schema._field_orders,
                     "entity_order": schema._entity_order,
-                    "relation_order": getattr(schema, '_relation_order', [])
+                    "relation_order": getattr(schema, '_relation_order', []),
+                    "classification_tasks": classification_tasks
                 }
             else:
                 schema_dict = schema
+                # Extract classification task names from dict schema
+                classification_tasks = [c["task"] for c in schema_dict.get("classifications", [])]
                 metadata = {
                     "field_metadata": {}, "entity_metadata": {},
                     "relation_metadata": {}, "field_orders": {},
-                    "entity_order": [], "relation_order": []
+                    "entity_order": [], "relation_order": [],
+                    "classification_tasks": classification_tasks
                 }
 
             # Ensure classifications have true_label
@@ -432,8 +438,9 @@ class GLiNER2(Extractor):
                 for i, result in enumerate(batch_results):
                     meta = metadata_list[sample_idx + i]
                     requested_relations = meta.get("relation_order", [])
+                    classification_tasks = meta.get("classification_tasks", [])
                     batch_results[i] = self.format_results(
-                        result, include_confidence, requested_relations
+                        result, include_confidence, requested_relations, classification_tasks
                     )
 
             all_results.extend(batch_results)
@@ -675,7 +682,8 @@ class GLiNER2(Extractor):
 
             idx = entity_names.index(name)
             meta = metadata.get("entity_metadata", {}).get(name, {})
-            ent_threshold = meta.get("threshold") or threshold
+            meta_threshold = meta.get("threshold")
+            ent_threshold = meta_threshold if meta_threshold is not None else threshold
             dtype = meta.get("dtype", "list")
 
             spans = self._find_spans(
@@ -732,7 +740,8 @@ class GLiNER2(Extractor):
 
         rel_threshold = threshold
         if rel_name in metadata.get("relation_metadata", {}):
-            rel_threshold = metadata["relation_metadata"][rel_name].get("threshold") or threshold
+            meta_threshold = metadata["relation_metadata"][rel_name].get("threshold")
+            rel_threshold = meta_threshold if meta_threshold is not None else threshold
 
         ordered_fields = metadata.get("field_orders", {}).get(rel_name, field_names)
 
@@ -818,7 +827,8 @@ class GLiNER2(Extractor):
                 fidx = field_names.index(fname)
                 field_key = f"{struct_name}.{fname}"
                 meta = metadata.get("field_metadata", {}).get(field_key, {})
-                field_threshold = meta.get("threshold") or threshold
+                meta_threshold = meta.get("threshold")
+                field_threshold = meta_threshold if meta_threshold is not None else threshold
                 dtype = meta.get("dtype", "list")
                 validators = meta.get("validators", [])
 
@@ -977,30 +987,50 @@ class GLiNER2(Extractor):
         self,
         results: Dict,
         include_confidence: bool = False,
-        requested_relations: List[str] = None
+        requested_relations: List[str] = None,
+        classification_tasks: List[str] = None
     ) -> Dict[str, Any]:
         """Format extraction results."""
         formatted = {}
         relations = {}
         requested_relations = requested_relations or []
+        classification_tasks = classification_tasks or []
 
         for key, value in results.items():
+            # Check if this is a classification task (takes priority)
+            is_classification = key in classification_tasks
+            
             # Check if this is a relation
             is_relation = False
             
-            # Check if key is in requested_relations (this takes priority)
-            if key in requested_relations:
-                is_relation = True
-            # Otherwise, check the value structure
-            elif isinstance(value, list) and len(value) > 0:
-                # Check for tuple format: [(head, tail), ...]
-                if isinstance(value[0], tuple) and len(value[0]) == 2:
+            if not is_classification:
+                # Check if key is in requested_relations (this takes priority)
+                if key in requested_relations:
                     is_relation = True
-                # Check for dict format with head/tail keys: [{"head": ..., "tail": ...}, ...]
-                elif isinstance(value[0], dict) and "head" in value[0] and "tail" in value[0]:
-                    is_relation = True
+                # Otherwise, check the value structure
+                elif isinstance(value, list) and len(value) > 0:
+                    # Check for tuple format: [(head, tail), ...]
+                    if isinstance(value[0], tuple) and len(value[0]) == 2:
+                        is_relation = True
+                    # Check for dict format with head/tail keys: [{"head": ..., "tail": ...}, ...]
+                    elif isinstance(value[0], dict) and "head" in value[0] and "tail" in value[0]:
+                        is_relation = True
 
-            if is_relation:
+            if is_classification:
+                # This is a classification task - format and add to formatted dict directly
+                if isinstance(value, list):
+                    # Multi-label classification
+                    if include_confidence:
+                        formatted[key] = [{"label": l, "confidence": c} for l, c in value]
+                    else:
+                        formatted[key] = [l for l, _ in value]
+                elif isinstance(value, tuple):
+                    # Single-label classification
+                    label, conf = value
+                    formatted[key] = {"label": label, "confidence": conf} if include_confidence else label
+                else:
+                    formatted[key] = value
+            elif is_relation:
                 # This is a relation - store in relations dict, not formatted
                 # Relations should always be lists, but handle edge cases defensively
                 if isinstance(value, list):

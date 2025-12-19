@@ -36,6 +36,7 @@ Basic Examples:
 
 from __future__ import annotations
 
+import gc
 import json
 import logging
 import math
@@ -212,7 +213,6 @@ class TrainingConfig:
     prefetch_factor: int = 2
     seed: int = 42
     deterministic: bool = False
-    gradient_checkpointing: bool = False
     local_rank: int = -1
     debug: bool = False
     max_train_samples: int = -1
@@ -619,6 +619,11 @@ class GLiNER2Trainer:
         
         logger.info("Setting up LoRA for parameter-efficient fine-tuning...")
         
+        # Freeze ALL model parameters BEFORE applying LoRA
+        for param in self.model.parameters():
+            param.requires_grad = False
+        logger.info("Froze all model parameters for LoRA training")
+        
         # Create LoRA config
         lora_config = LoRAConfig(
             enabled=True,
@@ -629,6 +634,8 @@ class GLiNER2Trainer:
         )
         
         # Apply LoRA (encoder: targeted modules, non-encoder: all linear layers)
+        # LoRA layers' lora_A and lora_B are nn.Parameter created after freezing,
+        # so they have requires_grad=True by default - only these get trained
         self.model, self.lora_layers = apply_lora_to_model(
             model=self.model,
             config=lora_config,
@@ -751,47 +758,16 @@ class GLiNER2Trainer:
         """Create optimizer with appropriate parameters based on LoRA configuration."""
         
         if self.config.use_lora:
-            # When using LoRA: train LoRA parameters + task-specific heads
+            # When using LoRA: ONLY train LoRA parameters (everything else is frozen)
             lora_params = get_lora_parameters(self.model)
-            task_params = []
             
-            # Get task-specific parameters (not in encoder, not LoRA)
-            for name, param in self.model.named_parameters():
-                if not param.requires_grad:
-                    continue
-                # Skip encoder parameters (they're frozen except LoRA)
-                if "encoder" in name:
-                    continue
-                # Skip LoRA parameters (already collected above)
-                if "lora_A" in name or "lora_B" in name:
-                    continue
-                task_params.append(param)
+            if not lora_params:
+                raise ValueError("No LoRA parameters found. Check LoRA configuration.")
             
-            # Use task_lr for both LoRA and task parameters
-            param_groups = []
-            if lora_params:
-                param_groups.append({
-                    "params": lora_params,
-                    "lr": self.config.task_lr,
-                    "weight_decay": self.config.weight_decay
-                })
-            if task_params:
-                param_groups.append({
-                    "params": task_params,
-                    "lr": self.config.task_lr,
-                    "weight_decay": self.config.weight_decay
-                })
-            
-            if not param_groups:
-                raise ValueError("No trainable parameters found. Check LoRA configuration.")
-            
-            logger.info(
-                f"Optimizer: LoRA params={len(lora_params)}, "
-                f"Task params={len(task_params)}, LR={self.config.task_lr}"
-            )
+            logger.info(f"Optimizer: LoRA params only = {len(lora_params)}, LR={self.config.task_lr}")
             
             return AdamW(
-                param_groups,
+                [{"params": lora_params, "lr": self.config.task_lr, "weight_decay": self.config.weight_decay}],
                 betas=(self.config.adam_beta1, self.config.adam_beta2),
                 eps=self.config.adam_epsilon,
             )
@@ -923,9 +899,6 @@ class GLiNER2Trainer:
         amp_dtype = torch.bfloat16 if self.config.bf16 else torch.float16
         self.scaler = GradScaler(enabled=self.config.fp16)
 
-        if self.config.gradient_checkpointing:
-            self.model.encoder.gradient_checkpointing_enable()
-
         # Logging
         logger.info("***** Running Training *****")
         logger.info(f"  Num examples = {len(train_dataset)}")
@@ -970,21 +943,40 @@ class GLiNER2Trainer:
             for step, batch in enumerate(train_loader):
                 samples_seen += len(batch)
 
-                with autocast(enabled=use_amp, dtype=amp_dtype):
-                    outputs = self.model(batch)
-                    loss = outputs["total_loss"]
+                try:
+                    with autocast(enabled=use_amp, dtype=amp_dtype):
+                        outputs = self.model(batch)
+                        loss = outputs["total_loss"]
 
-                    if self.config.gradient_accumulation_steps > 1:
-                        loss = loss / self.config.gradient_accumulation_steps
+                        if self.config.gradient_accumulation_steps > 1:
+                            loss = loss / self.config.gradient_accumulation_steps
 
-                if self.config.fp16:
-                    self.scaler.scale(loss).backward()
-                else:
-                    loss.backward()
+                    # Skip batches where loss doesn't require grad (edge cases in data)
+                    if not loss.requires_grad:
+                        logger.warning(
+                            f"Skipping batch {step}: loss doesn't require grad "
+                            f"(loss={loss.item():.4f}). This may indicate edge cases in your data."
+                        )
+                        continue
 
-                tr_loss += loss.item()
-                epoch_loss += loss.item()
-                epoch_steps += 1
+                    if self.config.fp16:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+
+                    tr_loss += loss.item()
+                    epoch_loss += loss.item()
+                    epoch_steps += 1
+
+                except torch.cuda.OutOfMemoryError:
+                    logger.warning(
+                        f"OOM at step {step}, batch skipped. "
+                        f"Consider reducing batch_size or max sequence length."
+                    )
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    self.optimizer.zero_grad()
+                    continue
 
                 if (step + 1) % self.config.gradient_accumulation_steps == 0:
                     if self.config.fp16:
@@ -1022,9 +1014,11 @@ class GLiNER2Trainer:
                         self._log_metrics(metrics, prefix="train")
                         tr_loss = 0.0
 
-                    if self.config.eval_strategy == "steps" and self.global_step % self.config.eval_steps == 0 and eval_dataset:
-                        self._evaluate(eval_dataset)
-                        self.model.train()
+                    if self.config.eval_strategy == "steps" and self.global_step % self.config.eval_steps == 0:
+                        if eval_dataset:
+                            self._evaluate(eval_dataset)
+                            self.model.train()
+                            self.processor.change_mode(is_training=True)
                         self._save_checkpoint(f"checkpoint-{self.global_step}")
 
                     self.progress_bar.update(1)
@@ -1042,13 +1036,15 @@ class GLiNER2Trainer:
             avg_epoch_loss = self._safe_divide(epoch_loss, epoch_steps, default=0.0)
             logger.info(f"Epoch {epoch + 1}/{num_epochs} - Loss: {avg_epoch_loss:.4f}")
 
-            if self.config.eval_strategy == "epoch" and eval_dataset:
-                eval_metrics = self._evaluate(eval_dataset)
-                self.model.train()
+            if self.config.eval_strategy == "epoch":
+                if eval_dataset:
+                    eval_metrics = self._evaluate(eval_dataset)
+                    self.model.train()
+                    self.processor.change_mode(is_training=True)
+                    if self.config.early_stopping and self._check_early_stopping(eval_metrics):
+                        logger.info(f"Early stopping triggered at epoch {epoch + 1}")
+                        break
                 self._save_checkpoint(f"checkpoint-epoch-{epoch + 1}")
-                if self.config.early_stopping and self._check_early_stopping(eval_metrics):
-                    logger.info(f"Early stopping triggered at epoch {epoch + 1}")
-                    break
 
             if self.global_step >= max_steps:
                 break
@@ -1058,7 +1054,7 @@ class GLiNER2Trainer:
 
         if self.is_main_process:
             self._save_checkpoint("final")
-            if self.wandb_run:
+            if self.config.report_to_wandb:
                 import wandb
                 wandb.summary["best_metric"] = self.best_metric
                 wandb.summary["total_steps"] = self.global_step
@@ -1196,14 +1192,14 @@ class GLiNER2Trainer:
             if postfix:
                 self.progress_bar.set_postfix(postfix)
 
-        # W&B logging (HuggingFace style)
-        if self.wandb_run:
+        # W&B logging
+        if self.config.report_to_wandb and self.is_main_process:
             try:
                 import wandb
                 # Filter out NaN and Inf values for wandb
                 wandb_metrics = {
-                    f"{prefix}_{k}": v 
-                    for k, v in metrics.items() 
+                    k: v
+                    for k, v in metrics.items()
                     if isinstance(v, (int, float)) and not (math.isnan(v) or math.isinf(v))
                 }
                 if wandb_metrics:
@@ -1274,7 +1270,7 @@ class GLiNER2Trainer:
         )
 
         # Save model artifacts to W&B for best and final checkpoints
-        if self.wandb_run and name in ["best", "final"]:
+        if self.config.report_to_wandb and name in ["best", "final"]:
             try:
                 import wandb
                 artifact = wandb.Artifact(
@@ -1289,7 +1285,7 @@ class GLiNER2Trainer:
                     }
                 )
                 artifact.add_dir(str(checkpoint_dir))
-                self.wandb_run.log_artifact(artifact)
+                wandb.log_artifact(artifact)
             except Exception as e:
                 logger.warning(f"W&B artifact upload failed: {e}")
 

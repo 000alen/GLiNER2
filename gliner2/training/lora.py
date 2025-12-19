@@ -193,11 +193,14 @@ class LoRALayer(nn.Module):
         for param in self.base_layer.parameters():
             param.requires_grad = False
         
+        # Get device from base layer to ensure LoRA parameters are on same device
+        device = next(base_layer.parameters()).device
+        
         # LoRA low-rank matrices
         # A: (r, in_features) - initialized with small random values
         # B: (out_features, r) - initialized to zero (no change at start)
-        self.lora_A = nn.Parameter(torch.zeros(r, in_features))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, r))
+        self.lora_A = nn.Parameter(torch.zeros(r, in_features, device=device))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, r, device=device))
         
         # Initialize A with Kaiming uniform (same as nn.Linear default)
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
@@ -445,7 +448,10 @@ def get_lora_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
 
 def merge_lora_weights(model: nn.Module) -> int:
     """
-    Merge all LoRA weights into their base layers.
+    Merge all LoRA weights into base layers and remove LoRA structure.
+    
+    After calling this, the model will have standard Linear layers with
+    merged weights. LoRA adapters are removed from the model.
     
     Parameters
     ----------
@@ -455,7 +461,7 @@ def merge_lora_weights(model: nn.Module) -> int:
     Returns
     -------
     int
-        Number of layers merged.
+        Number of layers merged and removed.
     """
     count = 0
     already_merged = 0
@@ -471,6 +477,12 @@ def merge_lora_weights(model: nn.Module) -> int:
         logger.debug(f"Merged LoRA weights in {count} layers")
     if already_merged > 0:
         logger.debug(f"Skipped {already_merged} layers (already merged)")
+    
+    # Remove LoRA layers after merging
+    if count > 0 or already_merged > 0:
+        remove_lora_from_model(model)
+        logger.info(f"Merged and removed LoRA layers from model")
+    
     return count
 
 
@@ -727,8 +739,10 @@ def load_lora_adapter(
             lora_b_key = f"{name}.lora_B"
             
             if lora_a_key in lora_state and lora_b_key in lora_state:
-                module.lora_A.data = lora_state[lora_a_key]
-                module.lora_B.data = lora_state[lora_b_key]
+                # Move loaded tensors to the same device as the module
+                device = next(module.parameters()).device
+                module.lora_A.data = lora_state[lora_a_key].to(device)
+                module.lora_B.data = lora_state[lora_b_key].to(device)
                 logger.debug(f"Loaded weights for {name}")
             else:
                 logger.warning(f"No saved weights found for {name}")

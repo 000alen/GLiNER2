@@ -598,6 +598,33 @@ class Extractor(PreTrainedModel):
             self._adapter_config = None
         return self
     
+    def merge_lora(self) -> 'Extractor':
+        """
+        Merge LoRA weights into base model and remove adapter structure.
+        
+        After calling this, the model will have standard Linear layers with
+        merged weights. LoRA adapters are permanently removed.
+        
+        Returns:
+            self for method chaining
+            
+        Raises:
+            ValueError: If no adapter is loaded
+            
+        Example:
+            model.load_adapter("./my_adapter")
+            model.merge_lora()  # Now model has merged weights, no LoRA
+            model.save_pretrained("./merged_model")
+        """
+        if not self._lora_layers:
+            raise ValueError("No adapter loaded. Nothing to merge.")
+        
+        from gliner2.training.lora import merge_lora_weights
+        merge_lora_weights(self)
+        self._lora_layers = {}
+        self._adapter_config = None
+        return self
+    
     def save_adapter(self, save_path: str) -> None:
         """
         Save only the LoRA adapter (not full model).
@@ -628,6 +655,7 @@ class Extractor(PreTrainedModel):
         self, 
         save_directory: str,
         save_adapter_only: bool = False,
+        merge_lora: bool = True,
         **kwargs
     ):
         """
@@ -636,12 +664,19 @@ class Extractor(PreTrainedModel):
         Args:
             save_directory: Where to save
             save_adapter_only: If True and adapter loaded, save only adapter
+            merge_lora: If True and LoRA active, merge LoRA weights into base
+                       model and remove adapter structure before saving.
+                       WARNING: This permanently removes LoRA from the model instance.
         """
         if save_adapter_only:
             if not self._lora_layers:
                 raise ValueError("save_adapter_only=True but no adapter loaded")
             self.save_adapter(save_directory)
             return
+        
+        # Handle LoRA merging if requested
+        if merge_lora and self._lora_layers:
+            self.merge_lora()
         
         # Original save logic
         os.makedirs(save_directory, exist_ok=True)

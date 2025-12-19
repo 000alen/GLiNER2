@@ -55,6 +55,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Tuple, Iterator, TYPE_CHECKING
 from collections import Counter
+from tqdm import tqdm
 
 if TYPE_CHECKING:
     # Forward declarations for type checking only
@@ -312,34 +313,44 @@ class DataLoader_Factory:
     @staticmethod
     def _validate_records(records: List[Dict]) -> Tuple[List[int], List[Tuple[int, Dict, List[str]]]]:
         """
-        Validate all records and return validation results.
+        Validate and sanitize all records, removing only invalid parts.
         
-        Validation is always strict: checks that entity spans, relation values,
-        and structure field values exist in the text.
+        Uses granular sanitization:
+        - Entities: Drop entity type if any mention not found
+        - Classifications: Drop individual invalid classifications
+        - Structures: Remove invalid fields, drop if all invalid
+        - Relations: Drop relation if any field invalid
+        - Record: Drop only if no valid tasks remain
         
         Returns
         -------
         Tuple[List[int], List[Tuple[int, Dict, List[str]]]]
-            - First element: List of valid record indices
-            - Second element: List of (index, record, error_messages) for invalid records
+            - First element: List of valid record indices (sanitized records replace originals)
+            - Second element: List of (index, original_record, warning_messages) for dropped records
         """
         valid_indices = []
         invalid_info = []
         
-        for i, record in enumerate(records):
-            errors = []
+        for i, record in tqdm(enumerate(records), total=len(records), desc="Validating records", unit="record"):
+            warnings = []
             try:
                 example = InputExample.from_dict(record)
-                record_errors = example.validate()
-                if record_errors:
-                    errors.extend(record_errors)
+                sanitize_warnings, is_valid = example.sanitize()
+                
+                if is_valid:
+                    # Replace record with sanitized version
+                    records[i] = example.to_dict()
+                    valid_indices.append(i)
+                    if sanitize_warnings:
+                        # Record was sanitized but still valid
+                        warnings.extend(sanitize_warnings)
+                else:
+                    # No valid content remains
+                    warnings.extend(sanitize_warnings)
+                    invalid_info.append((i, record, warnings))
             except Exception as e:
-                errors.append(f"Failed to parse - {e}")
-            
-            if errors:
-                invalid_info.append((i, record, errors))
-            else:
-                valid_indices.append(i)
+                warnings.append(f"Failed to parse - {e}")
+                invalid_info.append((i, record, warnings))
         
         return valid_indices, invalid_info
 
@@ -396,6 +407,10 @@ class Classification:
             self._true_label_list = [self.true_label]
         else:
             self._true_label_list = list(self.true_label)
+        
+        # Auto-infer multi_label=True when multiple true labels are provided
+        if len(self._true_label_list) > 1:
+            self.multi_label = True
 
     def validate(self) -> List[str]:
         """Validate this classification and return list of errors."""
@@ -700,6 +715,151 @@ class InputExample:
     def is_valid(self) -> bool:
         """Check if this example is valid."""
         return len(self.validate()) == 0
+
+    def sanitize(self) -> Tuple[List[str], bool]:
+        """
+        Remove invalid parts from this example, keeping only valid content.
+        Mutates self in-place.
+        
+        Granular removal strategy:
+        - Entities: Drop entire entity type if ANY mention is not found in text
+        - Classifications: Drop individual classifications that have errors
+        - Structures: Remove invalid fields; drop structure only if ALL fields become invalid
+        - Relations: Drop the specific relation if ANY field has an error
+        - Example: Mark as invalid only if no valid tasks remain
+        
+        Returns
+        -------
+        Tuple[List[str], bool]
+            - List of warning messages about what was removed
+            - bool: True if example still has valid content, False if should be dropped
+        """
+        warnings = []
+        
+        if not self.text or not self.text.strip():
+            warnings.append("Text is empty")
+            return warnings, False
+        
+        # 1. Sanitize entities - drop entity type if any mention not found
+        if self.entities:
+            types_to_remove = []
+            for entity_type, mentions in self.entities.items():
+                if not entity_type:
+                    types_to_remove.append(entity_type)
+                    warnings.append(f"Entity type is empty")
+                    continue
+                
+                # Check if any mention is not in text
+                has_invalid = False
+                for mention in mentions:
+                    if mention and mention.lower() not in self.text.lower():
+                        has_invalid = True
+                        warnings.append(f"Entity '{mention}' (type: {entity_type}) not found in text - dropping entity type")
+                        break
+                
+                if has_invalid:
+                    types_to_remove.append(entity_type)
+            
+            # Remove invalid entity types
+            for entity_type in types_to_remove:
+                del self.entities[entity_type]
+            
+            # Clean up entity descriptions for removed types
+            if self.entity_descriptions:
+                desc_to_remove = [desc_type for desc_type in self.entity_descriptions if desc_type not in self.entities]
+                for desc_type in desc_to_remove:
+                    del self.entity_descriptions[desc_type]
+        
+        # 2. Sanitize classifications - drop individual invalid ones
+        if self.classifications:
+            valid_classifications = []
+            for cls in self.classifications:
+                cls_errors = cls.validate()
+                if cls_errors:
+                    warnings.append(f"Classification '{cls.task}' has errors - dropping: {cls_errors[0]}")
+                else:
+                    valid_classifications.append(cls)
+            self.classifications = valid_classifications
+        
+        # 3. Sanitize structures - remove invalid fields, drop if all invalid
+        if self.structures:
+            valid_structures = []
+            for struct in self.structures:
+                if not struct.struct_name:
+                    warnings.append(f"Structure has empty name - dropping")
+                    continue
+                
+                if not struct._fields:
+                    warnings.append(f"Structure '{struct.struct_name}' has no fields - dropping")
+                    continue
+                
+                # Filter out invalid fields
+                valid_fields = {}
+                for field_name, value in struct._fields.items():
+                    is_valid = True
+                    
+                    if isinstance(value, ChoiceField):
+                        field_errors = value.validate(f"{struct.struct_name}.{field_name}")
+                        if field_errors:
+                            warnings.append(f"Field '{struct.struct_name}.{field_name}' invalid - dropping field")
+                            is_valid = False
+                    elif isinstance(value, list):
+                        for v in value:
+                            if v and v.lower() not in self.text.lower():
+                                warnings.append(f"List value '{v}' in '{struct.struct_name}.{field_name}' not found - dropping field")
+                                is_valid = False
+                                break
+                    elif isinstance(value, str):
+                        if value and value.lower() not in self.text.lower():
+                            warnings.append(f"Value '{value}' for '{struct.struct_name}.{field_name}' not found - dropping field")
+                            is_valid = False
+                    
+                    if is_valid:
+                        valid_fields[field_name] = value
+                
+                # Only keep structure if it has at least one valid field
+                if valid_fields:
+                    struct._fields = valid_fields
+                    valid_structures.append(struct)
+                else:
+                    warnings.append(f"Structure '{struct.struct_name}' has no valid fields - dropping")
+            
+            self.structures = valid_structures
+        
+        # 4. Sanitize relations - drop entire relation if any field is invalid
+        if self.relations:
+            valid_relations = []
+            for rel in self.relations:
+                if not rel.name:
+                    warnings.append(f"Relation has empty name - dropping")
+                    continue
+                
+                if not rel._fields:
+                    warnings.append(f"Relation '{rel.name}' has no fields - dropping")
+                    continue
+                
+                # Check if any field value is invalid
+                has_invalid = False
+                for field_name, value in rel._fields.items():
+                    if isinstance(value, str) and value:
+                        if value.lower() not in self.text.lower():
+                            warnings.append(f"Relation '{rel.name}' field '{field_name}' value '{value}' not found - dropping relation")
+                            has_invalid = True
+                            break
+                
+                if not has_invalid:
+                    valid_relations.append(rel)
+            
+            self.relations = valid_relations
+        
+        # Check if example still has any valid content
+        has_content = bool(self.entities) or bool(self.classifications) or bool(self.structures) or bool(self.relations)
+        
+        if not has_content:
+            warnings.append("No valid tasks remain after sanitization")
+            return warnings, False
+        
+        return warnings, True
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to GLiNER2 training format."""
