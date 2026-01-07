@@ -21,3 +21,8 @@ from .training.lora import (
     merge_lora_weights,
     unmerge_lora_weights,
 )
+from .inference.deterministic import (
+    DeterministicMode,
+    DeterministicLevel,
+    deterministic_inference,
+)
