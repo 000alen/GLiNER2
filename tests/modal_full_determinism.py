@@ -513,15 +513,18 @@ def run_nondeterministic_comparison() -> dict:
     Compare deterministic vs non-deterministic mode to show the difference.
     
     This demonstrates that without deterministic mode, results CAN vary by batch size.
+    Shows actual numerical differences in confidence scores.
     """
     import sys
     sys.path.insert(0, "/root")
+    import struct
     
     import torch
     from gliner2 import GLiNER2
     
     results = {
         "cuda_available": torch.cuda.is_available(),
+        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "tests": {},
     }
     
@@ -536,49 +539,170 @@ def run_nondeterministic_comparison() -> dict:
     
     test_text = "Apple CEO Tim Cook announced the new iPhone 15 Pro at the Cupertino headquarters."
     entity_types = ["company", "person", "product", "location"]
-    texts = [test_text] * 16
+    texts = [test_text] * 32
+    batch_sizes = [1, 2, 4, 8, 16, 32]
     
+    def extract_entity_confidences(result):
+        """Extract entity name -> confidence mapping."""
+        confidences = {}
+        entities = result.get("entities", {})
+        for entity_type, entity_list in entities.items():
+            for entity in entity_list:
+                if isinstance(entity, dict) and "text" in entity and "confidence" in entity:
+                    key = f"{entity_type}:{entity['text']}"
+                    confidences[key] = entity["confidence"]
+        return confidences
+    
+    def get_bits(val):
+        """Get IEEE 754 float32 bit pattern."""
+        return struct.unpack('I', struct.pack('f', val))[0]
+    
+    # =========================================================================
     # Run WITHOUT deterministic mode
-    print("\n=== Non-deterministic mode ===")
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("WITHOUT DETERMINISTIC MODE (deterministic=False)")
+    print("=" * 70)
+    
     nondet_results = {}
-    for bs in [1, 2, 4, 8, 16]:
+    nondet_confidences = {}
+    
+    for bs in batch_sizes:
         batch_results = model.batch_extract_entities(
             texts[:bs],
             entity_types,
             batch_size=bs,
-            deterministic=False,  # Non-deterministic
+            deterministic=False,
             include_confidence=True
         )
         nondet_results[bs] = batch_results[0]
-        print(f"  Batch size {bs}: hash={hash_result(batch_results[0])}")
+        nondet_confidences[bs] = extract_entity_confidences(batch_results[0])
     
-    nondet_match, nondet_details = results_match(list(nondet_results.values()))
+    # Find entities that appear in all batch sizes
+    common_entities = set(nondet_confidences[1].keys())
+    for bs in batch_sizes[1:]:
+        common_entities &= set(nondet_confidences[bs].keys())
+    
+    # Show numerical differences
+    print("\nConfidence values by batch size:")
+    print("-" * 70)
+    
+    nondet_diffs = {}
+    for entity in sorted(common_entities):
+        values = [nondet_confidences[bs].get(entity, 0) for bs in batch_sizes]
+        bits = [get_bits(v) for v in values]
+        
+        # Calculate max ULP difference from batch_size=1
+        ref_bits = bits[0]
+        ulp_diffs = [abs(b - ref_bits) for b in bits]
+        max_ulp = max(ulp_diffs)
+        max_abs_diff = max(abs(v - values[0]) for v in values)
+        
+        nondet_diffs[entity] = {
+            "values": values,
+            "max_ulp": max_ulp,
+            "max_abs_diff": max_abs_diff
+        }
+        
+        print(f"\n  {entity}:")
+        for bs, val, ulp in zip(batch_sizes, values, ulp_diffs):
+            bits_hex = f"0x{get_bits(val):08X}"
+            ulp_str = f"(+{ulp} ULP)" if ulp > 0 else "(reference)"
+            print(f"    batch_{bs:2d}: {val:.10f}  {bits_hex}  {ulp_str}")
+        
+        if max_ulp > 0:
+            print(f"    ⚠️  MAX DIFFERENCE: {max_abs_diff:.2e} ({max_ulp} ULP)")
+    
+    nondet_has_diffs = any(d["max_ulp"] > 0 for d in nondet_diffs.values())
+    
     results["tests"]["non_deterministic"] = {
-        "consistent": nondet_match,
-        "details": nondet_details,
-        "note": "May or may not be consistent - depends on GPU scheduling"
+        "has_differences": nondet_has_diffs,
+        "entity_diffs": nondet_diffs,
+        "summary": "Results VARY by batch size" if nondet_has_diffs else "Results happened to match (lucky run)"
     }
     
+    # =========================================================================
     # Run WITH deterministic mode
-    print("\n=== Deterministic mode ===")
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("WITH DETERMINISTIC MODE (deterministic=True)")
+    print("=" * 70)
+    
     det_results = {}
-    for bs in [1, 2, 4, 8, 16]:
+    det_confidences = {}
+    
+    for bs in batch_sizes:
         batch_results = model.batch_extract_entities(
             texts[:bs],
             entity_types,
             batch_size=bs,
-            deterministic=True,  # Deterministic
+            deterministic=True,
             include_confidence=True
         )
         det_results[bs] = batch_results[0]
-        print(f"  Batch size {bs}: hash={hash_result(batch_results[0])}")
+        det_confidences[bs] = extract_entity_confidences(batch_results[0])
     
-    det_match, det_details = results_match(list(det_results.values()))
+    # Show numerical values (should all be identical)
+    print("\nConfidence values by batch size:")
+    print("-" * 70)
+    
+    det_diffs = {}
+    for entity in sorted(common_entities):
+        values = [det_confidences[bs].get(entity, 0) for bs in batch_sizes]
+        bits = [get_bits(v) for v in values]
+        
+        ref_bits = bits[0]
+        ulp_diffs = [abs(b - ref_bits) for b in bits]
+        max_ulp = max(ulp_diffs)
+        max_abs_diff = max(abs(v - values[0]) for v in values)
+        
+        det_diffs[entity] = {
+            "values": values,
+            "max_ulp": max_ulp,
+            "max_abs_diff": max_abs_diff
+        }
+        
+        print(f"\n  {entity}:")
+        for bs, val, ulp in zip(batch_sizes, values, ulp_diffs):
+            bits_hex = f"0x{get_bits(val):08X}"
+            status = "✓" if ulp == 0 else "✗"
+            print(f"    batch_{bs:2d}: {val:.10f}  {bits_hex}  {status}")
+        
+        if max_ulp == 0:
+            print(f"    ✓ BITWISE IDENTICAL across all batch sizes")
+    
+    det_has_diffs = any(d["max_ulp"] > 0 for d in det_diffs.values())
+    
     results["tests"]["deterministic"] = {
-        "consistent": det_match,
-        "details": det_details,
-        "note": "Should ALWAYS be consistent with deterministic=True"
+        "has_differences": det_has_diffs,
+        "entity_diffs": det_diffs,
+        "summary": "Results are BITWISE IDENTICAL" if not det_has_diffs else "UNEXPECTED: Results differ!"
     }
+    
+    # =========================================================================
+    # Summary comparison
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    
+    total_nondet_ulp = sum(d["max_ulp"] for d in nondet_diffs.values())
+    total_det_ulp = sum(d["max_ulp"] for d in det_diffs.values())
+    
+    results["summary"] = {
+        "non_deterministic_total_ulp_drift": total_nondet_ulp,
+        "deterministic_total_ulp_drift": total_det_ulp,
+        "entities_compared": len(common_entities)
+    }
+    
+    print(f"\nEntities compared: {len(common_entities)}")
+    print(f"\nWithout deterministic mode:")
+    print(f"  Total ULP drift: {total_nondet_ulp}")
+    print(f"  Status: {'⚠️  RESULTS VARY BY BATCH SIZE' if nondet_has_diffs else '(happened to match this run)'}")
+    
+    print(f"\nWith deterministic mode:")
+    print(f"  Total ULP drift: {total_det_ulp}")
+    print(f"  Status: {'✓ BITWISE IDENTICAL' if not det_has_diffs else '✗ UNEXPECTED DIFFERENCES'}")
     
     return results
 
@@ -598,18 +722,33 @@ def main(use_a100: bool = False, compare_modes: bool = False, verbose: bool = Fa
     print("=" * 70)
     
     if compare_modes:
-        print("\nRunning mode comparison...")
+        print("\nRunning mode comparison to demonstrate non-determinism...")
+        print("This shows that WITHOUT deterministic mode, results vary by batch size.\n")
         results = run_nondeterministic_comparison.remote()
         
-        print("\n" + "-" * 70)
-        print("Mode Comparison Results:")
-        print("-" * 70)
+        # The detailed output is already printed by the remote function
+        # Just show the final verdict
+        print("\n" + "=" * 70)
+        print("VERDICT")
+        print("=" * 70)
         
-        for mode, data in results["tests"].items():
-            print(f"\n{mode.upper()}:")
-            print(f"  Consistent: {data['consistent']}")
-            print(f"  Details: {data['details']}")
-            print(f"  Note: {data['note']}")
+        if "summary" in results:
+            summary = results["summary"]
+            nondet_drift = summary.get("non_deterministic_total_ulp_drift", 0)
+            det_drift = summary.get("deterministic_total_ulp_drift", 0)
+            
+            if nondet_drift > 0 and det_drift == 0:
+                print("\n✓ DEMONSTRATION SUCCESSFUL")
+                print(f"\n  Without deterministic mode: {nondet_drift} ULP total drift")
+                print(f"  With deterministic mode:    {det_drift} ULP total drift (bitwise identical)")
+                print("\n  This proves that the deterministic patches eliminate batch-size")
+                print("  dependent floating-point variations in the inference pipeline.")
+            elif nondet_drift == 0:
+                print("\n⚠️  Non-deterministic mode happened to produce identical results")
+                print("    this run. This can happen due to GPU scheduling luck.")
+                print("    Run again or try different inputs to observe variation.")
+            else:
+                print("\n✗ UNEXPECTED: Deterministic mode showed drift!")
         
         return results
     
