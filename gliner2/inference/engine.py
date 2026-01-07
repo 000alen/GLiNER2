@@ -39,6 +39,12 @@ from torch.utils.data import DataLoader
 
 from gliner2.model import Extractor
 from gliner2.processor import PreprocessedBatch
+from gliner2.inference.deterministic import (
+    DeterministicMode,
+    DeterministicLevel,
+    batch_invariant_einsum,
+    is_batch_invariant_mode,
+)
 
 if TYPE_CHECKING:
     from gliner2.api_client import GLiNER2API
@@ -330,7 +336,8 @@ class GLiNER2(Extractor):
         num_workers: int = 0,
         format_results: bool = True,
         include_confidence: bool = False,
-        include_spans: bool = False
+        include_spans: bool = False,
+        deterministic: Union[bool, str, DeterministicLevel] = False,
     ) -> List[Dict[str, Any]]:
         """
         Extract from multiple texts with parallel preprocessing.
@@ -344,13 +351,58 @@ class GLiNER2(Extractor):
             format_results: Format output nicely
             include_confidence: Include confidence scores
             include_spans: Include character-level start/end positions
+            deterministic: Enable deterministic/batch-invariant inference.
+                - False: Standard (non-deterministic) inference
+                - True or "batch_invariant": Full batch invariance (GPU and CPU)
+                - "basic": PyTorch deterministic algorithms only (run-to-run only)
 
         Returns:
             List of extraction results
+
+        Note:
+            **GPU inference** (deterministic=True):
+            Results are guaranteed to be identical regardless of batch_size.
+            Uses custom Triton kernels with ~25-40% performance overhead.
+
+            **CPU inference** (deterministic=True):
+            Results are guaranteed to be identical regardless of batch_size.
+            Uses sequential reduction kernels with ~3-5x performance overhead.
         """
         if not texts:
             return []
 
+        # Handle deterministic mode
+        if deterministic:
+            if isinstance(deterministic, bool):
+                det_level = DeterministicLevel.BATCH_INVARIANT
+            elif isinstance(deterministic, str):
+                det_level = DeterministicLevel(deterministic)
+            else:
+                det_level = deterministic
+
+            with DeterministicMode(level=det_level):
+                return self._batch_extract_impl(
+                    texts, schemas, batch_size, threshold, num_workers,
+                    format_results, include_confidence, include_spans
+                )
+        else:
+            return self._batch_extract_impl(
+                texts, schemas, batch_size, threshold, num_workers,
+                format_results, include_confidence, include_spans
+            )
+
+    def _batch_extract_impl(
+        self,
+        texts: List[str],
+        schemas: Union[Schema, List[Schema], Dict, List[Dict]],
+        batch_size: int,
+        threshold: float,
+        num_workers: int,
+        format_results: bool,
+        include_confidence: bool,
+        include_spans: bool,
+    ) -> List[Dict[str, Any]]:
+        """Internal implementation of batch_extract."""
         self.eval()
         self.processor.change_mode(is_training=False)
 
@@ -634,9 +686,16 @@ class GLiNER2(Extractor):
 
         # Get span scores
         struct_proj = self.count_embed(embs[1:], pred_count)
-        span_scores = torch.sigmoid(
-            torch.einsum("lkd,bpd->bplk", span_info["span_rep"], struct_proj)
-        )
+
+        # Use batch-invariant einsum if deterministic mode is enabled
+        if is_batch_invariant_mode():
+            raw_scores = batch_invariant_einsum(
+                "lkd,bpd->bplk", span_info["span_rep"], struct_proj
+            )
+        else:
+            raw_scores = torch.einsum("lkd,bpd->bplk", span_info["span_rep"], struct_proj)
+
+        span_scores = torch.sigmoid(raw_scores)
 
         # Extract based on type
         if schema_name == "entities":
@@ -1145,27 +1204,31 @@ class GLiNER2(Extractor):
 
     def extract(self, text: str, schema, threshold: float = 0.5,
                 format_results: bool = True, include_confidence: bool = False,
-                include_spans: bool = False) -> Dict:
+                include_spans: bool = False, deterministic: bool = False) -> Dict:
         """Extract from single text."""
-        return self.batch_extract([text], schema, 1, threshold, 0, format_results, include_confidence, include_spans)[0]
+        return self.batch_extract(
+            [text], schema, 1, threshold, 0, format_results,
+            include_confidence, include_spans, deterministic
+        )[0]
 
     def extract_entities(self, text: str, entity_types, threshold: float = 0.5,
                         format_results: bool = True, include_confidence: bool = False,
-                        include_spans: bool = False) -> Dict:
+                        include_spans: bool = False, deterministic: bool = False) -> Dict:
         """Extract entities from text."""
         schema = self.create_schema().entities(entity_types)
-        return self.extract(text, schema, threshold, format_results, include_confidence, include_spans)
+        return self.extract(text, schema, threshold, format_results, include_confidence, include_spans, deterministic)
 
     def batch_extract_entities(self, texts: List[str], entity_types, batch_size: int = 8,
                                threshold: float = 0.5, format_results: bool = True,
-                               include_confidence: bool = False, include_spans: bool = False) -> List[Dict]:
+                               include_confidence: bool = False, include_spans: bool = False,
+                               deterministic: bool = False) -> List[Dict]:
         """Batch extract entities."""
         schema = self.create_schema().entities(entity_types)
-        return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans)
+        return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans, deterministic)
 
     def classify_text(self, text: str, tasks: Dict, threshold: float = 0.5,
                      format_results: bool = True, include_confidence: bool = False,
-                     include_spans: bool = False) -> Dict:
+                     include_spans: bool = False, deterministic: bool = False) -> Dict:
         """Classify text."""
         schema = self.create_schema()
         for name, config in tasks.items():
@@ -1175,11 +1238,12 @@ class GLiNER2(Extractor):
                 schema.classification(name, labels, **cfg)
             else:
                 schema.classification(name, config)
-        return self.extract(text, schema, threshold, format_results, include_confidence, include_spans)
+        return self.extract(text, schema, threshold, format_results, include_confidence, include_spans, deterministic)
 
     def batch_classify_text(self, texts: List[str], tasks: Dict, batch_size: int = 8,
                            threshold: float = 0.5, format_results: bool = True,
-                           include_confidence: bool = False, include_spans: bool = False) -> List[Dict]:
+                           include_confidence: bool = False, include_spans: bool = False,
+                           deterministic: bool = False) -> List[Dict]:
         """Batch classify texts."""
         schema = self.create_schema()
         for name, config in tasks.items():
@@ -1189,11 +1253,11 @@ class GLiNER2(Extractor):
                 schema.classification(name, labels, **cfg)
             else:
                 schema.classification(name, config)
-        return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans)
+        return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans, deterministic)
 
     def extract_json(self, text: str, structures: Dict, threshold: float = 0.5,
                     format_results: bool = True, include_confidence: bool = False,
-                    include_spans: bool = False) -> Dict:
+                    include_spans: bool = False, deterministic: bool = False) -> Dict:
         """Extract structured data."""
         schema = self.create_schema()
         for parent, fields in structures.items():
@@ -1201,11 +1265,12 @@ class GLiNER2(Extractor):
             for spec in fields:
                 name, dtype, choices, desc = self._parse_field_spec(spec)
                 builder.field(name, dtype=dtype, choices=choices, description=desc)
-        return self.extract(text, schema, threshold, format_results, include_confidence, include_spans)
+        return self.extract(text, schema, threshold, format_results, include_confidence, include_spans, deterministic)
 
     def batch_extract_json(self, texts: List[str], structures: Dict, batch_size: int = 8,
                           threshold: float = 0.5, format_results: bool = True,
-                          include_confidence: bool = False, include_spans: bool = False) -> List[Dict]:
+                          include_confidence: bool = False, include_spans: bool = False,
+                          deterministic: bool = False) -> List[Dict]:
         """Batch extract structured data."""
         schema = self.create_schema()
         for parent, fields in structures.items():
@@ -1213,21 +1278,22 @@ class GLiNER2(Extractor):
             for spec in fields:
                 name, dtype, choices, desc = self._parse_field_spec(spec)
                 builder.field(name, dtype=dtype, choices=choices, description=desc)
-        return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans)
+        return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans, deterministic)
 
     def extract_relations(self, text: str, relation_types, threshold: float = 0.5,
                          format_results: bool = True, include_confidence: bool = False,
-                         include_spans: bool = False) -> Dict:
+                         include_spans: bool = False, deterministic: bool = False) -> Dict:
         """Extract relations."""
         schema = self.create_schema().relations(relation_types)
-        return self.extract(text, schema, threshold, format_results, include_confidence, include_spans)
+        return self.extract(text, schema, threshold, format_results, include_confidence, include_spans, deterministic)
 
     def batch_extract_relations(self, texts: List[str], relation_types, batch_size: int = 8,
                                threshold: float = 0.5, format_results: bool = True,
-                               include_confidence: bool = False, include_spans: bool = False) -> List[Dict]:
+                               include_confidence: bool = False, include_spans: bool = False,
+                               deterministic: bool = False) -> List[Dict]:
         """Batch extract relations."""
         schema = self.create_schema().relations(relation_types)
-        return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans)
+        return self.batch_extract(texts, schema, batch_size, threshold, 0, format_results, include_confidence, include_spans, deterministic)
 
     def _parse_field_spec(self, spec: str) -> Tuple[str, str, Optional[List[str]], Optional[str]]:
         """Parse field specification string.
