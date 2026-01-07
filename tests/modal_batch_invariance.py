@@ -48,7 +48,7 @@ image = (
         "gliner",  # Required dependency
     )
     # Copy gliner2 package from repo root
-    .copy_local_dir(str(REPO_ROOT / "gliner2"), "/root/gliner2")
+    .add_local_dir(str(REPO_ROOT / "gliner2"), "/root/gliner2")
 )
 
 

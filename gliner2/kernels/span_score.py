@@ -73,7 +73,7 @@ def _batch_invariant_span_score_kernel(
     proj_base = b * stride_proj_b + p * stride_proj_p
 
     # Fixed-order reduction across D dimension
-    acc = tl.zeros((1,), dtype=tl.float32)
+    acc = 0.0
 
     for d_start in range(0, D, BLOCK_D):
         d_offsets = d_start + tl.arange(0, BLOCK_D)
@@ -94,7 +94,7 @@ def _batch_invariant_span_score_kernel(
         )
 
         # Accumulate dot product (fixed order via sequential blocks + tl.sum)
-        acc += tl.sum(span_vals.to(tl.float32) * proj_vals.to(tl.float32), axis=0)
+        acc += tl.sum(span_vals.to(tl.float32) * proj_vals.to(tl.float32))
 
     # Store result
     out_offset = b * stride_out_b + p * stride_out_p + l * stride_out_l + k * stride_out_k
@@ -207,7 +207,7 @@ def _batch_invariant_einsum_bmd_nd_bmn_kernel(
     a_base = b * stride_a_b + m * stride_a_m
     b_base = n * stride_b_n
 
-    acc = tl.zeros((1,), dtype=tl.float32)
+    acc = 0.0
 
     for d_start in range(0, D, BLOCK_D):
         d_offsets = d_start + tl.arange(0, BLOCK_D)
@@ -216,7 +216,7 @@ def _batch_invariant_einsum_bmd_nd_bmn_kernel(
         a_vals = tl.load(a_ptr + a_base + d_offsets * stride_a_d, mask=mask, other=0.0)
         b_vals = tl.load(b_ptr + b_base + d_offsets * stride_b_d, mask=mask, other=0.0)
 
-        acc += tl.sum(a_vals.to(tl.float32) * b_vals.to(tl.float32), axis=0)
+        acc += tl.sum(a_vals.to(tl.float32) * b_vals.to(tl.float32))
 
     out_offset = b * stride_out_b + m * stride_out_m + n * stride_out_n
     tl.store(output_ptr + out_offset, acc.to(output_ptr.dtype.element_ty))
